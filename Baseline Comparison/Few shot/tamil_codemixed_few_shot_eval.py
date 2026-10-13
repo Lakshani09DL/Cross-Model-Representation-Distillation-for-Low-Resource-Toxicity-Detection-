@@ -1,0 +1,328 @@
+"""
+Few-shot (8-shot) toxicity/offensive-language classification — Tamil code-mixed.
+
+8 class-balanced examples are drawn from the dataset's own train CSV. The
+val CSV is loaded for reference only (sample count) and isn't otherwise
+used. The test CSV is the evaluation set — no splitting happens in this
+script anymore.
+
+Split out of the original notebook so this runs as its own process. That on
+its own removes the main cause of the OOM (two ~multi-billion-parameter
+models being loaded into the same session back-to-back, with the notebook's
+accelerator set to "none" so both landed in CPU RAM). On top of that, this
+script:
+  - detects the device and warns if there's no GPU
+  - loads with low_cpu_mem_usage=True to cut peak RAM during loading
+  - wraps batched generation in a helper that auto-halves the batch and
+    retries on a CUDA OOM instead of crashing the run
+  - periodically clears the CUDA cache during the evaluation loop
+
+pip install torch transformers scikit-learn pandas numpy tqdm
+"""
+
+import gc
+import random
+import re
+import warnings
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from tqdm import tqdm
+from transformers import AutoModelForImageTextToText, AutoTokenizer, AutoModelForCausalLM
+
+# ----------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------
+TRAIN_CSV_PATH = "tamil_offensive_full_train.csv"  # used to draw the few-shot examples
+VAL_CSV_PATH = "tamil_offensive_full_dev.csv"      # loaded for reference only, not evaluated on
+TEST_CSV_PATH = "tamil_offensive_full_test.csv"    # the evaluation set
+# NOTE: the notebook's dataset listing only ever showed the test file above —
+# adjust TRAIN_CSV_PATH / VAL_CSV_PATH to whatever your train/val files are
+# actually named in the Kaggle dataset.
+MODEL_NAME = "google/gemma-4-E2B-it"
+# MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+# MODEL_NAME = "Qwen/Qwen3.5-2B"
+# MODEL_NAME = "microsoft/Phi-3.5-mini-instruct"
+
+# NOTE: this name isn't one we recognize —
+# if it 404s, it was likely meant to be "google/gemma-3n-E2B-it" (Gemma 3n).
+BATCH_SIZE = 8
+MAX_LENGTH = 512
+MAX_NEW_TOKENS = 3
+N_BOOTSTRAP = 10_000
+USE_4BIT = False  # set True (needs `pip install bitsandbytes`) for extra headroom on small GPUs
+N_FEWSHOT = 8
+RANDOM_STATE = 42
+
+LABEL_MAP = {
+    "Not_offensive": 0,
+    "Offensive_Untargetede": 1,
+    "Offensive_Targeted_Insult_Individual": 1,
+    "Offensive_Targeted_Insult_Group": 1,
+    "Offensive_Targeted_Insult_Other": 1,
+}
+
+
+# ----------------------------------------------------------------------
+# Data loading
+# ----------------------------------------------------------------------
+def load_and_clean(csv_path):
+    """Shared parsing for the Tamil train/val/test files — same tab-
+    separated, no-header format as the original evaluation CSV."""
+    df = pd.read_csv(csv_path, sep="\t", header=None, on_bad_lines="skip")
+    df = df[[0, 1]].copy()
+    df.columns = ["comment", "category"]
+    df = df.dropna(subset=["comment", "category"]).reset_index(drop=True)
+
+    df = df[df["category"] != "not-Tamil"].copy()
+    df["label"] = df["category"].map(LABEL_MAP)
+
+    X = df["comment"].tolist()
+    y = df["label"].values
+    return X, y
+
+
+def load_data(train_csv_path, val_csv_path, test_csv_path):
+    X_train, y_train = load_and_clean(train_csv_path)
+    print(f"Train samples: {len(X_train)}")
+
+    X_val, y_val = load_and_clean(val_csv_path)
+    print(f"Val samples:   {len(X_val)}")
+
+    X_test, y_test = load_and_clean(test_csv_path)
+    print(f"Test samples:  {len(X_test)}")
+
+    # fewshot_examples = select_fewshot_examples(X_train, y_train, N_FEWSHOT)
+    fewshot_examples = [("Padam nalla comedy padama irukum polaye..", 0),
+    ("கவுண்டர் தேவர்.சார்பாக வெற்றி பெற வாழ்த்துக்கள்", 0),
+    ("Nerkonda parvai...  Sema sema sema trailer", 0),
+    ("இந்த படம் கண்டிப்பாக வெற்றியடைய வேண்டும் என வாழ்த்துகிறேன்....", 0),
+    ("Short film ah yum vittu vakalaya... Enada panni vachirukeenga", 1),
+    ("Otha vaaya odachiruven thalapathiya pathu sirichirukka", 1),
+    ("Naaa arasiyalukku varuvathu uruthi.....Rajini tells this dialog since 96. Semme joke.", 1),
+    ("Friend nu FB la Like Kudukkara Friend  dunu nenachiya life be kudukkanu da", 1)]
+
+    print(f"Few shot examples: {fewshot_examples}")
+
+    print(f"Total samples to evaluate: {len(X_test)}")
+    return X_test, y_test, fewshot_examples
+
+
+def select_fewshot_examples(X_train, y_train, n_fewshot, seed=RANDOM_STATE):
+    """Pick a small, class-balanced set of few-shot examples from the
+    training split, in a fixed (shuffled) order for reproducibility."""
+    y_train = np.asarray(y_train)
+    classes = sorted(set(y_train.tolist()))
+    rng = np.random.default_rng(seed)
+
+    per_class = n_fewshot // len(classes)
+    remainder = n_fewshot - per_class * len(classes)
+
+    examples = []
+    for i, c in enumerate(classes):
+        idx = np.where(y_train == c)[0]
+        take = min(per_class + (1 if i < remainder else 0), len(idx))
+        chosen = rng.choice(idx, size=take, replace=False)
+        examples.extend((X_train[j], int(y_train[j])) for j in chosen)
+
+    random.Random(seed).shuffle(examples)
+    print(f"Few-shot examples: {len(examples)} (labels: {[lbl for _, lbl in examples]})")
+    return examples
+
+
+# ----------------------------------------------------------------------
+# Model loading
+# ----------------------------------------------------------------------
+def load_model(model_name):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        print(
+            "WARNING: no GPU detected — running a multi-billion-parameter "
+            "model on CPU. This is slow and the most common cause of OOM; "
+            "enable a GPU accelerator if you can."
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    # Few-shot prompts run longer than zero-shot ones; if truncation ever
+    # kicks in, eat into the earliest few-shot examples, not the live query.
+    tokenizer.truncation_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    load_kwargs = dict(low_cpu_mem_usage=True)
+    if device == "cuda":
+        load_kwargs["dtype"] = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        load_kwargs["device_map"] = {"": 0}
+    else:
+        load_kwargs["dtype"] = torch.float32
+
+    if USE_4BIT:
+        from transformers import BitsAndBytesConfig
+
+        load_kwargs.pop("dtype", None)
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16
+        )
+
+    print(f"Loading {model_name} on {device}...")
+    model = AutoModelForImageTextToText.from_pretrained(model_name, **load_kwargs)
+    # model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    if device == "cpu":
+        model.to(device)
+    model.eval()
+    return model, tokenizer, device
+
+
+# ----------------------------------------------------------------------
+# Prompting
+# ----------------------------------------------------------------------
+def format_prompt(tokenizer, text, fewshot_examples):
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert NLP content moderator. Classify the "
+                "user's comment as either 0 (non-offensive) or 1 "
+                "(offensive/toxic). Answer ONLY with a single digit: 0 or 1."
+            ),
+        },
+    ]
+    for ex_text, ex_label in fewshot_examples:
+        messages.append({"role": "user", "content": f"Comment: {ex_text}\nAnswer:"})
+        messages.append({"role": "assistant", "content": str(ex_label)})
+    messages.append({"role": "user", "content": f"Comment: {text}\nAnswer:"})
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+# ----------------------------------------------------------------------
+# OOM-safe batched generation
+# ----------------------------------------------------------------------
+def generate_batch_safe(model, tokenizer, prompts):
+    """Generate for one batch; on a CUDA OOM, halve the batch and retry
+    instead of letting the whole run die."""
+    try:
+        inputs = tokenizer(
+            prompts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH
+        ).to(model.device)
+        with torch.inference_mode():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        input_len = inputs["input_ids"].shape[1]
+        decoded = tokenizer.batch_decode(outputs[:, input_len:], skip_special_tokens=True)
+        del inputs, outputs
+        return decoded
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        gc.collect()
+        if len(prompts) == 1:
+            raise
+        mid = len(prompts) // 2
+        print(f"  OOM at batch size {len(prompts)} — retrying as {mid} + {len(prompts) - mid}")
+        return generate_batch_safe(model, tokenizer, prompts[:mid]) + generate_batch_safe(
+            model, tokenizer, prompts[mid:]
+        )
+
+
+def evaluate(model, tokenizer, X_test, device, fewshot_examples):
+    preds = []
+    print("Running batch evaluation...")
+    for i in tqdm(range(0, len(X_test), BATCH_SIZE)):
+        batch = X_test[i : i + BATCH_SIZE]
+        prompts = [format_prompt(tokenizer, t, fewshot_examples) for t in batch]
+        decoded_texts = generate_batch_safe(model, tokenizer, prompts)
+
+        for text in decoded_texts:
+            match = re.search(r"[01]", text)
+            preds.append(int(match.group()) if match else 0)
+
+        if device == "cuda" and (i // BATCH_SIZE) % 20 == 0:
+            torch.cuda.empty_cache()
+
+    return np.array(preds)
+
+
+# ----------------------------------------------------------------------
+# Metrics
+# ----------------------------------------------------------------------
+def bootstrap_ci(y_true, y_pred, n_bootstrap=N_BOOTSTRAP, ci=95, seed=42):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    n = len(y_true)
+    rng = np.random.default_rng(seed)
+
+    accs, f1_macros, f1_toxics, precisions, recalls = [], [], [], [], []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # suppress undefined-F1 warnings on degenerate resamples
+        for _ in tqdm(range(n_bootstrap), desc="Bootstrapping"):
+            idx = rng.integers(0, n, n)
+            yt, yp = y_true[idx], y_pred[idx]
+            accs.append(accuracy_score(yt, yp))
+            f1_macros.append(f1_score(yt, yp, average="macro"))
+            f1_toxics.append(f1_score(yt, yp, pos_label=1))
+            precisions.append(precision_score(yt, yp, pos_label=1))
+            recalls.append(recall_score(yt, yp, pos_label=1))
+
+    lo, hi = (100 - ci) / 2, 100 - (100 - ci) / 2
+
+    def summarize(vals):
+        vals = np.array(vals)
+        return vals.mean(), np.percentile(vals, lo), np.percentile(vals, hi)
+
+    return {
+        "accuracy": summarize(accs),
+        "f1_macro": summarize(f1_macros),
+        "f1_toxic": summarize(f1_toxics),
+    }
+
+
+def report(y_test, preds, boot):
+    acc = accuracy_score(y_test, preds)
+    f1_macro = f1_score(y_test, preds, average="macro")
+    f1_toxic = f1_score(y_test, preds, pos_label=1)
+
+    print("\n" + "=" * 40)
+    print("       MINISTRAL 3B EVALUATION RESULTS       ")
+    print("=" * 40)
+    print(f"Accuracy:    {acc:.6f}")
+    print(f"F1 (Macro):  {f1_macro:.6f}")
+    print(f"F1 (Toxic):  {f1_toxic:.6f}\n")
+    print(classification_report(y_test, preds, target_names=["Non-toxic (0)", "Toxic (1)"], digits=6))
+
+    print("\n" + "=" * 40)
+    print(f"   BOOTSTRAP 95% CONFIDENCE INTERVALS (n={N_BOOTSTRAP:,})   ")
+    print("=" * 40)
+    for name, (mean, lo, hi) in boot.items():
+        print(f"{name:10s}: {mean:.6f}  [{lo:.6f}, {hi:.6f}]")
+
+
+# ----------------------------------------------------------------------
+def main():
+    X_test, y_test, fewshot_examples = load_data(TRAIN_CSV_PATH, VAL_CSV_PATH, TEST_CSV_PATH)
+    model, tokenizer, device = load_model(MODEL_NAME)
+
+    preds = evaluate(model, tokenizer, X_test, device, fewshot_examples)
+    boot = bootstrap_ci(y_test, preds)
+    report(y_test, preds, boot)
+
+    # Free the model explicitly rather than waiting on process exit.
+    del model
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+
+if __name__ == "__main__":
+    main()
